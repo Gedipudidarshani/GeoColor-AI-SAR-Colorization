@@ -33,6 +33,32 @@ This pipeline decouples **despeckling** from **colour translation**, adds **stru
 
 ---
 
+## 💡 Proposed Solution
+
+The project treats SAR colorization as a **two-stage, physics-aware pipeline** rather than a single image-to-image translation step:
+
+| Stage | Component | What it does |
+| :--- | :--- | :--- |
+| **1** | **Despeckling CNN** | Estimates the multiplicative speckle component `F` and returns clean reflectivity `X` before any colour is generated |
+| **2** | **Colorization generator** | Translates the clean single-channel SAR map into a raw 3-channel optical-like RGB prediction |
+| **3** | **Structure-guided color fusion** | Injects radar luminance into the LAB lightness channel so roads, coastlines and building edges stay sharp |
+| **4** | **Epistemic uncertainty** | Monte-Carlo dropout passes give a per-pixel confidence map showing where the colours are least reliable |
+| **5** | **Dashboard & benchmarks** | Side-by-side visual inspection plus PSNR, SSIM, SAM, EPI and ENL on verified S1–S2 pairs |
+
+**Research track (planned):** a Swin-Transformer encoder conditions a latent diffusion U-Net inside a KL-f8 VAE latent space, trained with a physics-informed total-variation loss to discourage physically implausible colour.
+
+### Traditional vs. Existing vs. Proposed
+
+| Aspect | Traditional (lookup tables) | Early GANs (Pix2Pix / CycleGAN) | **This Project** |
+| :--- | :--- | :--- | :--- |
+| Context awareness | None (pixel-by-pixel) | Local convolutional context | Multi-scale context (Swin, planned) |
+| Speckle handling | Fails | Entangled with translation | Removed first in a dedicated stage |
+| Edge preservation | Poor | Often blurred | Radar luminance fusion + SSIM loss |
+| Hallucination control | None | Unconstrained | Physics-informed loss (planned) + uncertainty map |
+| Trust signal | None | None | Per-pixel uncertainty |
+
+---
+
 ## 🏗️ System Architecture
 
 The pipeline spans four architectural layers:
@@ -91,6 +117,25 @@ Raw SAR (Sentinel-1)
    ▼
 Colorized optical RGB  (+ GeoTIFF export with CRS preserved)
 ```
+
+---
+
+## 🛠️ Tech Stack
+
+| Layer | Technologies |
+| :--- | :--- |
+| **Language** | Python 3.10+ |
+| **Deep Learning** | PyTorch, torchvision |
+| **Planned Research Stack** | timm (Swin-Transformer), Hugging Face `diffusers` (VAE + U-Net), `pytorch-msssim` |
+| **Image Processing & Metrics** | OpenCV, scikit-image, NumPy, Pillow, tqdm |
+| **Geospatial (planned)** | GDAL, rasterio, rioxarray, ESA SNAP / pyroSAR, QGIS |
+| **Data Sources** | SEN12MS, Kaggle Sentinel-1&2 image pairs, Copernicus Data Space, Google Earth Engine |
+| **Dashboard** | Streamlit (`app.py`) |
+| **Experiment Tracking** | Weights & Biases or TensorBoard |
+| **Compute** | Kaggle / Colab GPUs, mixed precision (`torch.cuda.amp`) |
+| **Deployment (planned)** | FastAPI, Docker, ONNX / TensorRT |
+
+> ✏️ Keep only the libraries that appear in your `requirements.txt`; anything marked *planned* is part of the roadmap.
 
 ---
 
@@ -243,6 +288,11 @@ streamlit run app.py
 Upload a SAR image to view the raw input, the despeckled map, the colorized output and the quality metrics side by side.
 
 ---
+
+## 🖥️ Working Prototype & Screenshots
+
+Screenshots of the running prototype: the dashboard, the colorized outputs, the quality metrics and the evaluation run.
+
 <img width="982" height="235" alt="image" src="https://github.com/user-attachments/assets/8403d989-2f49-4957-b7f7-c44823525f57" />
 <img width="1917" height="1023" alt="image" src="https://github.com/user-attachments/assets/1c6973e5-7422-4da0-b031-73c138abd955" />
 <img width="1917" height="1027" alt="image" src="https://github.com/user-attachments/assets/32b057b6-0d55-4ec5-92c1-ba6d3f01ac6e" />
@@ -253,6 +303,7 @@ Upload a SAR image to view the raw input, the despeckled map, the colorized outp
 
 <img width="1917" height="873" alt="image" src="https://github.com/user-attachments/assets/f2c80ac7-6c44-45ce-947e-e5c85a3a0a6e" />
 
+---
 
 ## 🔭 Future Work
 
