@@ -68,6 +68,7 @@ The pipeline spans four architectural layers:
 │    - Verified S1–S2 pair benchmarking (eval_direct.py)                      │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+<img width="2040" height="1995" alt="architecture" src="https://github.com/user-attachments/assets/b15dd8d7-fe7b-4e47-9708-f55cfb15af33" />
 
 ### Research Architecture (Target Design)
 
