@@ -1,10 +1,11 @@
 # Physics-Guided SAR Image Colorization: Despeckling, Swin-Attention & Latent Diffusion Pipeline
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
+[![Status](https://img.shields.io/badge/status-research%20prototype-yellow.svg)](#-future-work)
 [![PyTorch](https://img.shields.io/badge/framework-PyTorch-EE4C2C.svg)](https://pytorch.org/)
 [![Sentinel-1/2](https://img.shields.io/badge/data-Sentinel--1%20%2B%20Sentinel--2-1F6FEB.svg)](https://dataspace.copernicus.eu/)
 [![ISRO SIH1733](https://img.shields.io/badge/problem%20statement-ISRO%20SIH1733-F37626.svg)](https://www.sih.gov.in/)
-[![Status](https://img.shields.io/badge/status-research%20prototype-yellow.svg)](#-future-work)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 An end-to-end remote sensing, generative AI, and geospatial data-engineering framework that converts single-polarization, speckle-corrupted **Synthetic Aperture Radar (SAR)** imagery into realistic **optical-like RGB maps**. Built on paired **Sentinel-1 / Sentinel-2** satellite telemetry, a modular **PyTorch** inference pipeline, and an interactive dashboard for side-by-side inspection and quantitative benchmarking.
