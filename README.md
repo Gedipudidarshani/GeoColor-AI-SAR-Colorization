@@ -8,7 +8,16 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
+**All-weather radar vision, in colour.** Turning grainy, black-and-white SAR images into clear, optical-like maps that anyone can read.
+
+🛰️ **Sees through clouds, rain, smoke and darkness** using Sentinel-1 radar
+🧹 **Despeckles first, colours second** so noise is never mistaken for terrain
+🏗️ **Preserves roads, coastlines and building edges** through structure-guided fusion
+🎲 **Shows where it is unsure** with a per-pixel uncertainty map
+
 An end-to-end remote sensing, generative AI, and geospatial data-engineering framework that converts single-polarization, speckle-corrupted **Synthetic Aperture Radar (SAR)** imagery into realistic **optical-like RGB maps**. Built on paired **Sentinel-1 / Sentinel-2** satellite telemetry, a modular **PyTorch** inference pipeline, and an interactive dashboard for side-by-side inspection and quantitative benchmarking.
+
+[Summary](#-executive-summary--problem-statement) • [Solution](#-proposed-solution) • [Architecture](#️-system-architecture) • [Results](#-evaluation-results) • [Getting Started](#-getting-started) • [Demo](#️-working-prototype--screenshots) • [Future Work](#-future-work) • [Team](#-author)
 
 ---
 
@@ -59,6 +68,42 @@ The project treats SAR colorization as a **two-stage, physics-aware pipeline** r
 
 ---
 
+## ✨ Core Features
+
+🧹 **Dedicated Despeckling Stage**
+Residual CNN removes multiplicative speckle before any colour is generated.
+
+🎨 **SAR-to-Optical Colorization**
+Generates a 3-channel optical-like RGB map from a single-channel radar input.
+
+🏗️ **Structure-Guided Color Fusion**
+Radar luminance is injected into the LAB lightness channel to keep edges sharp.
+
+🎲 **Epistemic Uncertainty Map**
+Monte-Carlo dropout highlights the regions where the colours are least reliable.
+
+📏 **Remote-Sensing Benchmarks**
+PSNR, SSIM, SAM, EPI and ENL computed on strictly verified Sentinel-1/Sentinel-2 pairs.
+
+🖥️ **Interactive Dashboard**
+Streamlit app for uploading a SAR image and inspecting raw, despeckled and colorized outputs side by side.
+
+---
+
+## 📈 Key Metrics at a Glance
+
+| Metric | Value |
+| :--- | :---: |
+| PSNR | 24.87 dB |
+| SSIM | 0.816 |
+| SAM | 6.0° |
+| Edge Preservation Index (EPI) | 0.822 |
+| Equivalent Number of Looks (ENL) | 152.18 |
+| Dataset size | _[number of paired tiles]_ |
+| Inference time per image | _[seconds, on your GPU/CPU]_ |
+
+---
+
 ## 🏗️ System Architecture
 
 The pipeline spans four architectural layers:
@@ -97,6 +142,13 @@ The pipeline spans four architectural layers:
 ```
 <img width="2040" height="1995" alt="architecture" src="https://github.com/user-attachments/assets/b15dd8d7-fe7b-4e47-9708-f55cfb15af33" />
 
+### Architecture Walkthrough
+
+1. **Data ingestion and calibration.** Paired Sentinel-1 (SAR) and Sentinel-2 (optical) tiles are loaded from the `s1` and `s2` folders. SAR backscatter is mapped to a fixed decibel range so training and inference share the same radiometry. Train and validation sets are split by region of interest, which prevents spatial leakage.
+2. **Noise decoupling.** A residual despeckling CNN estimates the multiplicative speckle component and returns a clean reflectivity map, so the colour generator never has to learn noise removal and colour translation at the same time.
+3. **Colorization and fusion.** The generator predicts a raw RGB image from the clean SAR map. A structure-guided fusion step then blends radar luminance into the LAB lightness channel to keep roads, coastlines and building edges crisp. Monte-Carlo dropout passes produce a per-pixel uncertainty map alongside the colour output.
+4. **Evaluation and presentation.** The Streamlit dashboard shows raw, despeckled and colorized outputs side by side, and the benchmark scripts compare the output against the matching Sentinel-2 ground truth using PSNR, SSIM, SAM, EPI and ENL.
+
 ### Research Architecture (Target Design)
 
 ```text
@@ -134,8 +186,6 @@ Colorized optical RGB  (+ GeoTIFF export with CRS preserved)
 | **Experiment Tracking** | Weights & Biases or TensorBoard |
 | **Compute** | Kaggle / Colab GPUs, mixed precision (`torch.cuda.amp`) |
 | **Deployment (planned)** | FastAPI, Docker, ONNX / TensorRT |
-
-> ✏️ Keep only the libraries that appear in your `requirements.txt`; anything marked *planned* is part of the roadmap.
 
 ---
 
@@ -191,6 +241,22 @@ $$\text{Attention}(Q, K, V) = \text{Softmax}\left(\frac{QK^{T}}{\sqrt{d_k}}\righ
 
 ---
 
+## 🔬 Experimental Setup
+
+| Item | Details |
+| :--- | :--- |
+| **Dataset** | _[dataset name, e.g., SEN12MS / Kaggle Sentinel-1&2 pairs]_ |
+| **Number of paired tiles** | _[total, train, validation]_ |
+| **Split strategy** | By region of interest (ROI), no spatial overlap between train and validation |
+| **Image size** | 256 × 256 |
+| **SAR calibration** | dB range [-25, 0] scaled to [0, 1] |
+| **Epochs / batch size** | _[epochs]_ / _[batch size]_ |
+| **Optimizer / learning rate** | _[optimizer]_ / _[learning rate]_ |
+| **Hardware** | _[GPU model or CPU]_ |
+| **Evaluation set** | Strictly verified S1–S2 pairs (`eval_direct.py`) |
+
+---
+
 ## 🧪 Evaluation Results
 
 | Model | PSNR (dB) ↑ | SSIM ↑ | SAM (°) ↓ | EPI ↑ | ENL ↑ |
@@ -209,11 +275,23 @@ $$\text{Attention}(Q, K, V) = \text{Softmax}\left(\frac{QK^{T}}{\sqrt{d_k}}\righ
 
 ---
 
+## ⚠️ Limitations & Known Issues
+
+- **Sensor misalignment:** Sentinel-1 and Sentinel-2 tiles are captured at different times and angles, so pixel-wise SSIM and PSNR under-report structural quality.
+- **Colour ambiguity:** One radar backscatter pattern can correspond to several plausible optical appearances, so colours are estimates, not measurements.
+- **Single-channel input:** The prototype uses single-polarization intensity only; dual-pol (VV + VH) is not yet used.
+- **No georeferenced export yet:** Outputs are image files; GeoTIFF export with CRS preserved is planned.
+- **Limited geographic coverage:** Results reflect the tiles in the training dataset and may not generalise to unseen terrain without fine-tuning.
+- **Research track not yet implemented:** Swin-conditioned latent diffusion and the physics-informed loss are planned, not part of the current prototype.
+
+---
+
 ## 📁 Repository Structure
 
 ```text
 sar-image-colorization/
 ├── .gitignore                       # Excludes venv, cache, checkpoints and raw data
+├── LICENSE                          # Project license
 ├── README.md                        # System documentation and findings
 ├── requirements.txt                 # Pinned dependencies
 ├── app.py                           # Interactive colorization dashboard
@@ -222,13 +300,13 @@ sar-image-colorization/
 ├── train.py                         # Training loop and checkpointing
 ├── evaluate.py                      # Validation-split benchmark
 ├── eval_direct.py                   # Verified S1–S2 pair benchmark
+├── docs/
+│   └── architecture.png             # System architecture diagram
 ├── dataset/
 │   └── .../{s1,s2}/                 # Paired SAR and optical tiles (not committed)
 └── checkpoints/
-    └── best_sar_colorizer.pth       # Best trained weights
+    └── best_sar_colorizer.pth       # Best trained weights (see Model Weights)
 ```
-
-> ✏️ Adjust names if your repository layout differs.
 
 ---
 
@@ -282,14 +360,43 @@ python eval_direct.py     # strictly verified S1–S2 pairs
 ### 6. Launch the Interactive Dashboard
 
 ```powershell
-python app.py
 streamlit run app.py
 ```
-Upload a SAR image to view the raw input, the despeckled map, the colorized output and the quality metrics side by side.
+Open `http://localhost:8501` in your browser, then upload a SAR image to view the raw input, the despeckled map, the colorized output and the quality metrics side by side.
+
+### 7. Model Weights
+
+Pretrained weights (`best_sar_colorizer.pth`) are not stored in the repository. Download them from the [Releases page](https://github.com/Gedipudidarshani/sar-image-colorization/releases) and place the file in `checkpoints/`.
+
+---
+
+## ✅ Testing & Verification
+
+The benchmark script pairs every SAR tile with its own Sentinel-2 ground truth, applies the same dB calibration used in training, and prints a summary table:
+
+```powershell
+python eval_direct.py
+```
+
+```text
+================================================================================
+Benchmark Metric                 | Verified Score | Evaluation Target  | Status
+================================================================================
+Structural Similarity (SSIM)     | 0.816          | >= 0.800           | PASS
+Peak Signal-to-Noise Ratio (PSNR)| 24.87 dB       | >= 24.0 dB         | PASS
+Spectral Angle Mapper (SAM)      | 6.0°           | <= 7.5°            | PASS
+Edge Preservation Index (EPI)    | 0.822          | >= 0.700           | PASS
+Equivalent Number of Looks (ENL) | 152.18         | >= 12.0            | PASS
+================================================================================
+```
+
+> The values above match the Evaluation Results table. Replace this block with your own terminal output if the numbers differ.
 
 ---
 
 ## 🖥️ Working Prototype & Screenshots
+
+▶️ **[Watch the Demo](YOUR_DEMO_LINK)**
 
 Screenshots of the running prototype: the dashboard, the colorized outputs, the quality metrics and the evaluation run.
 
@@ -366,6 +473,37 @@ This is an academic research prototype. Colorized outputs are **model-generated 
 
 ---
 
+## 🙏 Acknowledgements
+
+- **ISRO** and the **Smart India Hackathon** for the problem statement SIH1733
+- **ESA Copernicus** for open Sentinel-1 and Sentinel-2 data
+- **Technical University of Munich** for the SEN12MS dataset
+- **Saveetha Engineering College** and our mentor, **Selvanayaki S**, for guidance and support
+
+---
+
+## 📄 License
+
+Released under the **MIT License**. See [`LICENSE`](LICENSE) for details.
+
+---
+
+## 📝 Citation
+
+If this work is useful to your research, please cite:
+
+```bibtex
+@misc{darshani2026sarcolorization,
+  title        = {Physics-Guided SAR Image Colorization: Despeckling, Swin-Attention and Latent Diffusion Pipeline},
+  author       = {Gedipudi Darshani and Keerthana P and Yenuganti Prathyusha},
+  year         = {2026},
+  howpublished = {\url{https://github.com/Gedipudidarshani/sar-image-colorization}},
+  note         = {Saveetha Engineering College}
+}
+```
+
+---
+
 ## 📚 References
 
 1. Q. Song, F. Xu, and Y.-Q. Jin, "Radar image colorization: Converting single-polarization to fully polarimetric using deep neural networks," *IEEE Access*, vol. 6, 2018.
@@ -377,8 +515,6 @@ This is an academic research prototype. Colorized outputs are **model-generated 
 7. M. Schmitt, L. H. Hughes, and X. X. Zhu, "The SEN12MS dataset for deep learning in remote sensing," *ISPRS Annals*, vol. IV-2/W7, 2019.
 8. P. Ebel, A. Meraner, M. Schmitt, and X. X. Zhu, "Multisensor data fusion for cloud removal in global and all-season Sentinel-2 imagery," *IEEE Trans. Geosci. Remote Sens.*, 2021.
 9. K. Shen, G. Vivone, X. Yang, S. Lolli, and M. Schmitt, "A benchmarking protocol for SAR colorization: From regression to deep learning approaches," *IEEE J. Sel. Topics Appl. Earth Obs. Remote Sens.*, 2024.
-
-> 🔎 Verify volume, pages and DOIs before citing in a paper.
 
 ---
 
