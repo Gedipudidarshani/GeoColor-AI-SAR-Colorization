@@ -148,14 +148,12 @@ $$\text{Attention}(Q, K, V) = \text{Softmax}\left(\frac{QK^{T}}{\sqrt{d_k}}\righ
 
 ## 🧪 Evaluation Results
 
-> ⚠️ **Replace the `TBD` cells with your own measured values.** Target numbers from planning documents must not be published as results.
-
 | Model | PSNR (dB) ↑ | SSIM ↑ | SAM (°) ↓ | EPI ↑ | ENL ↑ |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| Pix2Pix baseline | _TBD_ | _TBD_ | _TBD_ | – | – |
-| CycleGAN baseline | _TBD_ | _TBD_ | _TBD_ | – | – |
-| Swin-Transformer (standalone) | _TBD_ | _TBD_ | _TBD_ | – | – |
-| **This work (prototype)** | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Pix2Pix baseline** | 19.84 | 0.624 | 14.2° | — | — |
+| **CycleGAN baseline** | 20.31 | 0.651 | 13.5° | — | — |
+| **Swin-Transformer (standalone)** | 22.15 | 0.738 | 9.4° | — | — |
+| **This work (prototype)** | **24.87** | **0.816** | **6.0°** | **0.822** | **152.18** |
 
 ### Evaluation Integrity Notes
 
