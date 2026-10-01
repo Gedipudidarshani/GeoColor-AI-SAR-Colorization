@@ -243,9 +243,13 @@ python app.py
 Upload a SAR image to view the raw input, the despeckled map, the colorized output and the quality metrics side by side.
 
 ---
+<img width="1917" height="1021" alt="image" src="https://github.com/user-attachments/assets/a5d72fb3-12de-4a5c-88f5-7bddbea7c13e" />
+
 <img width="1917" height="1023" alt="image" src="https://github.com/user-attachments/assets/1c6973e5-7422-4da0-b031-73c138abd955" />
 <img width="1917" height="1027" alt="image" src="https://github.com/user-attachments/assets/32b057b6-0d55-4ec5-92c1-ba6d3f01ac6e" />
 <img width="1917" height="1022" alt="image" src="https://github.com/user-attachments/assets/abdd5073-d702-4aae-a6c8-466d2585f207" />
+<img width="982" height="235" alt="image" src="https://github.com/user-attachments/assets/8403d989-2f49-4957-b7f7-c44823525f57" />
+
 <img width="1917" height="873" alt="image" src="https://github.com/user-attachments/assets/f2c80ac7-6c44-45ce-947e-e5c85a3a0a6e" />
 
 
