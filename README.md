@@ -321,7 +321,7 @@ sar-image-colorization/
 
 ```powershell
 # Clone the repository
-git clone https://github.com/Gedipudidarshani/sar-image-colorization.git
+git clone https://github.com/Gedipudidarshani/GeoColor-AI-SAR-Colorization.git
 cd sar-image-colorization
 
 # Create and activate virtual environment
@@ -366,7 +366,7 @@ Open `http://localhost:8501` in your browser, then upload a SAR image to view th
 
 ### 7. Model Weights
 
-Pretrained weights (`best_sar_colorizer.pth`) are not stored in the repository. Download them from the [Releases page](https://github.com/Gedipudidarshani/sar-image-colorization/releases) and place the file in `checkpoints/`.
+Pretrained weights (`best_sar_colorizer.pth`) are not stored in the repository. Download them from the [Releases page](https://github.com/Gedipudidarshani/GeoColor-AI-SAR-Colorization.git/releases) and place the file in `checkpoints/`.
 
 ---
 
