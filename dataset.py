@@ -1,111 +1,89 @@
-import os
-import re
+import json
+import random
 from pathlib import Path
-import pandas as pd
+
 import numpy as np
-from PIL import Image
 import torch
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as T
+from PIL import Image
+from torch.utils.data import Dataset
+
+SPLIT_FILE = "splits.json"
+
 
 def find_dataset_root(candidate_name='dataset'):
     cwd = Path.cwd()
-    search_paths = [
-        cwd / candidate_name,
-        cwd.parent / candidate_name,
-        cwd / "archive (2)" / candidate_name,
-        cwd.parent / "archive (2)" / candidate_name,
-        cwd
-    ]
-    for p in search_paths:
-        if p.exists() and (list(p.rglob('*s1*.png')) or list(p.rglob('*.png'))):
+    for p in [cwd / candidate_name, cwd.parent / candidate_name]:
+        if p.exists():
             return p
     return cwd / candidate_name
 
 
-class RobustSARDataset(Dataset):
-    """Strict paired Sentinel-1 SAR to Sentinel-2 Optical dataset loader."""
-    def __init__(self, root_dir='dataset', img_size=256, is_train=True, db_min=-25.0, db_max=0.0):
-        self.root_dir = find_dataset_root(root_dir)
-        self.img_size = img_size
-        self.db_min = db_min
-        self.db_max = db_max
-        self.is_train = is_train
+def load_split(split, split_file=SPLIT_FILE):
+    if not Path(split_file).exists():
+        raise FileNotFoundError(f"'{split_file}' not found. Run `python splits.py` first.")
+    with open(split_file) as f:
+        return json.load(f)[split]
 
-        all_files = list(self.root_dir.rglob('*.png')) + list(self.root_dir.rglob('*.tif'))
-        records = []
 
-        for path in all_files:
-            p_str = str(path).lower()
-            is_s1 = ('\\s1\\' in p_str or '/s1/' in p_str or '_s1_' in path.name.lower())
+def subsample_balanced(records, per_class, seed=0):
+    """Deterministic class-balanced subset (used for val/test to bound runtime)."""
+    rng = random.Random(seed)
+    by_cls = {}
+    for r in records:
+        by_cls.setdefault(r["cls"], []).append(r)
+    out = []
+    for cls in sorted(by_cls):
+        items = sorted(by_cls[cls], key=lambda r: r["sar"])
+        rng.shuffle(items)
+        out.extend(items[:per_class])
+    return out
 
-            if is_s1:
-                # Find matching s2 optical file
-                opt_str = str(path).replace(f"{os.sep}s1{os.sep}", f"{os.sep}s2{os.sep}").replace("_s1_", "_s2_")
-                if not os.path.exists(opt_str):
-                    alt = str(path).replace('\\s1\\', '\\s2\\').replace('/s1/', '/s2/').replace('_s1_', '_s2_')
-                    if os.path.exists(alt):
-                        opt_str = alt
-                    else:
-                        continue  # Discard unpaired images
 
-                match = re.search(r'(rois\d+_[a-za-z]+_s\d+_\d+)', path.name, re.IGNORECASE)
-                roi_id = match.group(1) if match else path.stem.split('_')[0]
+def read_sar(path):
+    """8-bit Sentinel-1 tile -> float32 [H,W] in [0,1].
 
-                records.append({
-                    'sar_path': str(path),
-                    'opt_path': opt_str,
-                    'roi_id': roi_id,
-                    'file_name': path.name
-                })
+    The v_2 PNG tiles are already quantised backscatter; we only rescale to [0,1].
+    (The former "dB calibration" mapped [0,1]->[-25,0]dB->[0,1] and was an identity.)
+    """
+    return np.asarray(Image.open(path).convert('L'), dtype=np.float32) / 255.0
 
-        self.df = pd.DataFrame(records)
-        if len(self.df) == 0:
-            raise RuntimeError(f"No paired SAR-Optical files found under '{self.root_dir}'.")
 
-        unique_rois = self.df['roi_id'].unique()
-        np.random.seed(42)
-        np.random.shuffle(unique_rois)
-        
-        split_idx = max(1, int(len(unique_rois) * 0.85))
-        train_rois = set(unique_rois[:split_idx])
-        val_rois = set(unique_rois[split_idx:])
+def read_opt(path):
+    return np.asarray(Image.open(path).convert('RGB'), dtype=np.float32) / 255.0
 
-        if self.is_train:
-            self.df = self.df[self.df['roi_id'].isin(train_rois)].reset_index(drop=True)
-        else:
-            self.df = self.df[self.df['roi_id'].isin(val_rois)].reset_index(drop=True)
-            if len(self.df) == 0:
-                self.df = self.df.iloc[split_idx:].reset_index(drop=True)
+
+class PairedSARDataset(Dataset):
+    """Paired S1 -> S2 tiles from splits.json.
+
+    Training: random crop + horizontal/vertical flips + 90-degree rotations
+    (identical transform applied to SAR and optical).
+    """
+    def __init__(self, split="train", crop=None, augment=False, per_class=None, seed=0):
+        recs = load_split(split)
+        if per_class is not None:
+            recs = subsample_balanced(recs, per_class, seed)
+        self.records = recs
+        self.crop = crop
+        self.augment = augment
 
     def __len__(self):
-        return len(self.df)
-
-    def _read_sar(self, path):
-        raw_img = Image.open(path).convert('L')
-        arr = np.array(raw_img).astype(np.float32) / 255.0
-        # Radiometric decibel stretch
-        arr_db = self.db_min + arr * (self.db_max - self.db_min)
-        norm_sar = np.clip((arr_db - self.db_min) / (self.db_max - self.db_min), 0.0, 1.0)
-        img = Image.fromarray((norm_sar * 255.0).astype(np.uint8)).resize((self.img_size, self.img_size), Image.Resampling.BILINEAR)
-        return T.ToTensor()(img)  # Range [0, 1]
-
-    def _read_optical(self, path):
-        img = Image.open(path).convert('RGB').resize((self.img_size, self.img_size), Image.Resampling.BILINEAR)
-        return T.ToTensor()(img)  # Range [0, 1]
+        return len(self.records)
 
     def __getitem__(self, idx):
-        idx = int(idx.item()) if hasattr(idx, 'item') else int(idx)
-        row = self.df.iloc[idx]
-        return {
-            'sar': self._read_sar(row['sar_path']),
-            'optical': self._read_optical(row['opt_path']),
-            'filename': row['file_name']
-        }
-
-def get_dataloaders(root_dir='dataset', batch_size=8, img_size=256):
-    train_set = RobustSARDataset(root_dir=root_dir, img_size=img_size, is_train=True)
-    val_set = RobustSARDataset(root_dir=root_dir, img_size=img_size, is_train=False)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
-    return train_loader, val_loader
+        r = self.records[int(idx)]
+        sar = read_sar(r["sar"])
+        opt = read_opt(r["opt"])
+        if self.crop:
+            h, w = sar.shape
+            y = random.randint(0, h - self.crop)
+            x = random.randint(0, w - self.crop)
+            sar = sar[y:y + self.crop, x:x + self.crop]
+            opt = opt[y:y + self.crop, x:x + self.crop]
+        if self.augment:
+            k = random.randint(0, 3)
+            sar, opt = np.rot90(sar, k), np.rot90(opt, k)
+            if random.random() < 0.5:
+                sar, opt = sar[:, ::-1], opt[:, ::-1]
+        sar_t = torch.from_numpy(np.ascontiguousarray(sar))[None]
+        opt_t = torch.from_numpy(np.ascontiguousarray(opt)).permute(2, 0, 1)
+        return {"sar": sar_t, "optical": opt_t, "cls": r["cls"], "filename": Path(r["sar"]).name}

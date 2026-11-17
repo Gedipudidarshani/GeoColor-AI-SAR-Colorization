@@ -1,0 +1,18 @@
+\begin{tabular}{lcccc}
+\toprule
+Method & PSNR (dB)$\uparrow$ & SSIM$\uparrow$ & SAM ($^\circ$)$\downarrow$ & GMSD$\downarrow$ \\
+\midrule
+SAR as grey & 9.86$\pm$2.16 & 0.037$\pm$0.072 & 9.41$\pm$5.71 & 0.261$\pm$0.019 \\
+Mean colour & 13.96$\pm$2.30 & 0.238$\pm$0.112 & 9.88$\pm$5.95 & 0.288$\pm$0.034 \\
+\midrule
+U-Net (L1) & 14.14$\pm$3.00 & 0.237$\pm$0.098 & \textbf{11.23}$\pm$6.23$^\dagger$ & 0.274$\pm$0.040 \\
+Pix2Pix & 12.58$\pm$2.38 & 0.149$\pm$0.065 & 16.96$\pm$9.17 & \textbf{0.241}$\pm$0.027 \\
+Lee + Pix2Pix & 12.64$\pm$2.59 & 0.133$\pm$0.082 & 12.42$\pm$6.19 & 0.247$\pm$0.023 \\
+Ours (v1) & 12.14$\pm$2.96 & 0.161$\pm$0.094 & 14.45$\pm$7.34 & 0.249$\pm$0.026 \\
+\midrule
+Ours (final) & 14.33$\pm$2.55 & 0.248$\pm$0.100 & 11.81$\pm$9.52 & 0.278$\pm$0.035 \\
+Ours w/o GAN + R18 + FiLM (no label) & \textbf{14.55}$\pm$2.80 & \textbf{0.249}$\pm$0.107$^\dagger$ & 11.26$\pm$7.32 & 0.279$\pm$0.036 \\
+Ours + lum. repl. & 14.37$\pm$2.39 & 0.233$\pm$0.097 & 11.65$\pm$9.39 & 0.269$\pm$0.040 \\
+Ours + detail inj. & 14.33$\pm$2.56$^\dagger$ & 0.242$\pm$0.099 & 11.91$\pm$9.62 & 0.276$\pm$0.035 \\
+\bottomrule
+\end{tabular}

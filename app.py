@@ -1,137 +1,137 @@
+import io
+import json
+import os
+
+import matplotlib.cm as cm
+import numpy as np
 import streamlit as st
 import torch
-import numpy as np
-import io
-import os
-import cv2
 from PIL import Image
-import torchvision.transforms as T
-import matplotlib.cm as cm
-from models import SARColorizerGenerator
-from metrics import calculate_entropy, calculate_enl, calculate_epi
 
-st.set_page_config(
-    page_title="ISRO SIH1733: GeoColor AI Suite",
-    page_icon="🛰️",
-    layout="wide"
-)
+from fusion import chroma_boost, detail_injection, luminance_replacement
+from metrics import calculate_enl, calculate_entropy, calculate_epi, homogeneous_blocks
+from train import CLASSES, VARIANTS, build_generator
 
-# Dark Mode Styling
-st.markdown("""
-    <style>
-    .main { background-color: #0b0f17; color: #f8fafc; }
-    .stMetric { background-color: #131b2e; padding: 14px; border-radius: 8px; border: 1px solid #1e293b; }
-    h1, h2, h3 { color: #00f2fe; }
-    </style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="GeoColor AI: SAR Colorization", page_icon="🛰️", layout="wide")
+
+def pick_variant():
+    """Model chosen on the validation set by evaluate.py; otherwise the best available."""
+    if os.path.exists("results/metrics.json"):
+        with open("results/metrics.json") as f:
+            main = json.load(f).get("main")
+        if main and os.path.exists(f"checkpoints/{main}.pth"):
+            return main
+    for v in ["ours_r18_cond", "ours_r18", "ours_cond", "ours"]:
+        if os.path.exists(f"checkpoints/{v}.pth"):
+            return v
+    return None
+
 
 @st.cache_resource
-def load_production_model():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SARColorizerGenerator()
-    ckpt = 'checkpoints/best_sar_colorizer.pth'
-    if os.path.exists(ckpt):
-        model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
-    model.to(device)
-    model.eval()
-    return model, device
+def load_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    variant = pick_variant()
+    if variant is None:
+        return None, device, None
+    model = build_generator(variant, pretrained=False)
+    model.load_state_dict(torch.load(f"checkpoints/{variant}.pth", map_location=device, weights_only=True))
+    model.to(device).eval()
+    return model, device, variant
 
-model, device = load_production_model()
 
-st.title("🛰️ GeoColor AI: Physics-Guided SAR Colorization Engine")
-st.caption("ISRO SIH1733 Solution | Homomorphic Log-Domain Despeckling & Bayesian Uncertainty Guardrails")
+@st.cache_data
+def load_benchmark():
+    if os.path.exists("results/metrics.json"):
+        with open("results/metrics.json") as f:
+            return json.load(f)
+    return None
 
-st.sidebar.header("Mission Configurations")
-category = st.sidebar.selectbox("Terrain Categorization", ["urban", "grassland", "barrenland", "agri"])
-mc_passes = st.sidebar.slider("Bayesian MC Uncertainty Passes (1 = Sharpest)", 1, 10, 1)
-color_vibrancy = st.sidebar.slider("Color Saturation Multiplier", 1.0, 3.0, 2.0, 0.1)
-uploaded_file = st.sidebar.file_uploader("Upload Sentinel-1 SAR Image (s1)", type=["png", "jpg", "tif", "jpeg"])
 
-def structure_guided_color_fusion(sar_clean, raw_pred_rgb, vibrancy=2.0):
-    """
-    Fuses crisp radar structural luminance with rich, calibrated optical chromaticity.
-    Preserves roads and building edges while injecting natural Sentinel-2 colors.
-    """
-    # 1. Convert predicted RGB into LAB color space
-    pred_uint8 = np.clip(raw_pred_rgb * 255.0, 0, 255).astype(np.uint8)
-    lab_pred = cv2.cvtColor(pred_uint8, cv2.COLOR_RGB2LAB).astype(np.float32)
+model, device, variant = load_model()
+ckpt_used = f"checkpoints/{variant}.pth" if variant else None
+is_cond = bool(variant and VARIANTS[variant].get("cond"))
 
-    # 2. Linear histogram stretch on radar signal to preserve contrast
-    sar_stretched = cv2.normalize(sar_clean, None, alpha=20, beta=235, norm_type=cv2.NORM_MINMAX).astype(np.float32)
+st.title("🛰️ GeoColor AI: Physics-Guided SAR-to-Optical Colorization")
+st.caption("Homomorphic despeckling → U-Net colorization → structure-guided fusion → Monte Carlo dropout uncertainty")
+if ckpt_used is None:
+    st.error("No trained checkpoint found. Run `python train.py --variant ours` first.")
+    st.stop()
+st.sidebar.success(f"Model: `{ckpt_used}`")
 
-    # 3. Blend structural Luminance (70% radar details + 30% optical base)
-    lab_pred[:, :, 0] = 0.70 * sar_stretched + 0.30 * lab_pred[:, :, 0]
+with st.sidebar:
+    st.header("Inference settings")
+    uploaded = st.file_uploader("Sentinel-1 SAR tile (grayscale)", type=["png", "jpg", "jpeg", "tif", "tiff"])
+    terrain = st.selectbox("Terrain", ["Unknown"] + CLASSES, disabled=not is_cond,
+                           help="Conditions the colour palette (FiLM). 'Unknown' uses the label-free embedding."
+                           if is_cond else "The loaded model is not terrain-conditioned.")
+    mc_passes = st.slider("Monte Carlo dropout passes", 2, 20, 10,
+                          help="Number of stochastic forward passes. The colour shown is their mean; "
+                               "the uncertainty map is their per-pixel variance.")
+    fusion_mode = st.radio("Structure-guided fusion", ["Detail injection (proposed)", "Luminance replacement", "None (raw network output)"])
+    strength = st.slider("Fusion strength (β or α)", 0.0, 1.0, 0.25, 0.05,
+                         help="0.25 (β) and 0.1 (α) were selected on the validation scenes.")
+    vibrancy = st.slider("Display saturation", 0.5, 2.0, 1.0, 0.05,
+                         help="Display-only. Values other than 1.0 change colours for viewing and are not part of the evaluated method.")
+    unc_threshold = st.number_input("Uncertainty flag threshold (std)", 0.0, 0.5, 0.05, 0.01, format="%.2f")
 
-    # 4. Boost natural chromaticity (a* and b* channels centered at 128)
-    lab_pred[:, :, 1] = 128.0 + (lab_pred[:, :, 1] - 128.0) * vibrancy
-    lab_pred[:, :, 2] = 128.0 + (lab_pred[:, :, 2] - 128.0) * vibrancy
+if not uploaded:
+    st.info("Upload a Sentinel-1 tile, e.g. from `dataset/v_2/<terrain>/s1/`. Tiles from test scenes (see `splits.json`) were never seen in training.")
+    bench = load_benchmark()
+    if bench:
+        st.subheader("Held-out benchmark (from `results/metrics.json`)")
+        rows = [{"Method": bench["display"].get(m, m), "PSNR (dB)": round(s["psnr"], 2), "SSIM": round(s["ssim"], 3),
+                 "SAM (°)": round(s["sam"], 2), "GMSD": round(s["gmsd"], 3)} for m, s in bench["summary"].items()]
+        st.dataframe(rows, hide_index=True)
+        st.caption(f"{bench['n_test_tiles']} test tiles from scenes not used for training.")
+    st.stop()
 
-    # 5. Physics Guardrail: Neutralize extreme corner reflector highlights (keep concrete/metal bright gray-white)
-    corner_reflectors = sar_stretched > 215
-    lab_pred[:, :, 1][corner_reflectors] = 128.0 + (lab_pred[:, :, 1][corner_reflectors] - 128.0) * 0.15
-    lab_pred[:, :, 2][corner_reflectors] = 128.0 + (lab_pred[:, :, 2][corner_reflectors] - 128.0) * 0.15
+raw_pil = Image.open(uploaded).convert("L")
+if raw_pil.size != (256, 256):
+    st.warning(f"Input is {raw_pil.size[0]}×{raw_pil.size[1]}; resized to 256×256 (training tile size).")
+    raw_pil = raw_pil.resize((256, 256), Image.Resampling.BILINEAR)
+raw = np.asarray(raw_pil, dtype=np.float32) / 255.0
+x = torch.from_numpy(raw)[None, None].to(device)
 
-    # 6. Convert back to RGB
-    lab_clamped = np.clip(lab_pred, 0, 255).astype(np.uint8)
-    rgb_fused = cv2.cvtColor(lab_clamped, cv2.COLOR_LAB2RGB)
+with st.spinner(f"Running {mc_passes} Monte Carlo passes…"):
+    cls = torch.tensor([CLASSES.index(terrain)], device=device) if (is_cond and terrain != "Unknown") else None
+    clean_t, mean_t, var_t = model.predict_with_epistemic_uncertainty(x, passes=mc_passes, cls=cls)
 
-    # 7. Unsharp Masking for razor-sharp edge specifications
-    gaussian_blur = cv2.GaussianBlur(rgb_fused, (0, 0), 1.2)
-    sharpened_rgb = cv2.addWeighted(rgb_fused, 1.35, gaussian_blur, -0.35, 0)
+clean = clean_t[0, 0].cpu().numpy()
+pred = mean_t[0].permute(1, 2, 0).cpu().numpy()
+std_map = np.sqrt(var_t[0, 0].cpu().numpy())
 
-    return np.clip(sharpened_rgb, 0, 255).astype(np.uint8)
-
-if uploaded_file:
-    raw_pil = Image.open(uploaded_file).convert('L')
-    raw_arr = np.array(raw_pil).astype(np.float32)
-
-    resized = raw_pil.resize((256, 256), Image.Resampling.BILINEAR)
-    tensor = T.ToTensor()(resized).unsqueeze(0).to(device)
-
-    with st.spinner("Executing Physics-Informed Colorization..."):
-        clean_sar, mean_rgb, uncertainty = model.predict_with_epistemic_uncertainty(tensor, passes=mc_passes)
-
-        raw_pred_rgb = mean_rgb.squeeze(0).cpu().permute(1, 2, 0).numpy()
-        clean_np = np.clip(clean_sar.squeeze().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
-
-        # Apply structural fusion with adjustable color vibrancy
-        rgb_np = structure_guided_color_fusion(clean_np, raw_pred_rgb, vibrancy=color_vibrancy)
-
-        # Generate Inferno Uncertainty Heatmap
-        unc_np = uncertainty.squeeze().cpu().numpy()
-        unc_norm = (unc_np - unc_np.min()) / (unc_np.max() - unc_np.min() + 1e-6)
-        unc_heatmap = (cm.inferno(unc_norm)[:, :, :3] * 255.0).astype(np.uint8)
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.subheader("1. Raw SAR Intensity")
-        st.image(raw_pil, width="stretch", caption="Single-Pol Backscatter (s1)")
-    with c2:
-        st.subheader("2. Despeckled Reflectivity")
-        st.image(clean_np, width="stretch", caption="Homomorphic Filtered Signal")
-    with c3:
-        st.subheader("3. Colorized Optical RGB")
-        st.image(rgb_np, width="stretch", caption="Synthesized Multi-Spectral Map")
-    with c4:
-        st.subheader("4. Epistemic Uncertainty")
-        st.image(unc_heatmap, width="stretch", caption="Confidence Guardrail")
-
-    st.markdown("---")
-    st.subheader("Non-Reference Radar & Optical Metrics")
-
-    enl_val = calculate_enl(clean_np)
-    epi_val = calculate_epi(raw_arr, clean_np)
-    entropy_val = calculate_entropy(rgb_np)
-    unc_mean = float(unc_np.mean())
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Equivalent Looks (ENL)", f"{enl_val:.2f}", "Speckle Attenuation")
-    m2.metric("Edge Preservation (EPI)", f"{epi_val:.3f}", "Boundary Sharpness")
-    m3.metric("Spatial Entropy", f"{entropy_val:.2f} bits", "Information Density")
-    m4.metric("Hallucination Risk Level", "LOW" if unc_mean < 0.04 else "ELEVATED", f"Var: {unc_mean:.5f}")
-
-    buf = io.BytesIO()
-    Image.fromarray(rgb_np).save(buf, format='PNG')
-    st.download_button("Download Colorized Output", data=buf.getvalue(), file_name=f"colorized_{category}.png")
+if fusion_mode.startswith("Detail"):
+    rgb = detail_injection(clean, pred, beta=strength)
+elif fusion_mode.startswith("Luminance"):
+    rgb = luminance_replacement(clean, pred, alpha=strength)
 else:
-    st.info("Upload a Synthetic Aperture Radar capture (from `dataset/v_2/.../s1/`) to run the inference pipeline.")
+    rgb = pred
+rgb_display = (np.clip(chroma_boost(rgb, vibrancy), 0, 1) * 255).astype(np.uint8)
+
+unc_vis = std_map / (np.percentile(std_map, 99) + 1e-8)
+unc_heat = (cm.inferno(np.clip(unc_vis, 0, 1))[..., :3] * 255).astype(np.uint8)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.image(raw_pil, caption="1. Raw SAR backscatter", width="stretch")
+c2.image((clean * 255).astype(np.uint8), caption="2. Despeckled reflectivity (stage 1)", width="stretch")
+c3.image(rgb_display, caption="3. Colorized optical-like RGB", width="stretch")
+c4.image(unc_heat, caption="4. Epistemic uncertainty (MC-dropout std)", width="stretch")
+
+st.divider()
+st.subheader("Quality indicators for this tile (no ground truth needed)")
+blocks = homogeneous_blocks(raw)
+enl_raw, enl_clean = calculate_enl(raw, blocks), calculate_enl(clean, blocks)
+flagged = float((std_map > unc_threshold).mean() * 100)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("ENL (homogeneous areas)", f"{enl_clean:.1f}", f"{enl_clean - enl_raw:+.1f} vs raw",
+          help="Equivalent Number of Looks on the same homogeneous blocks of raw and despeckled SAR. Higher = less speckle.")
+m2.metric("Edge Preservation Index", f"{calculate_epi(raw, clean):.3f}",
+          help="Laplacian correlation with the raw SAR (1 = all edges kept). Read together with ENL.")
+m3.metric("Output entropy", f"{calculate_entropy(rgb_display):.2f} bits")
+m4.metric("Pixels flagged uncertain", f"{flagged:.1f}%", help=f"Share of pixels with MC-dropout std > {unc_threshold:.2f}.")
+st.caption(f"Mean predictive std: {std_map.mean():.4f}. Colours are a learned estimate of the optical appearance, "
+           "not a measurement; treat high-uncertainty regions with caution.")
+
+buf = io.BytesIO()
+Image.fromarray(rgb_display).save(buf, format="PNG")
+st.download_button("Download colorized PNG", buf.getvalue(), file_name=f"colorized_{os.path.splitext(uploaded.name)[0]}.png", mime="image/png")

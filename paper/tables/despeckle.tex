@@ -1,0 +1,13 @@
+\begin{tabular}{lccc}
+\toprule
+Filter & ENL$\uparrow$ & EPI$\uparrow$ & MoR (ideal 1) \\
+\midrule
+Raw SAR (no filter) & 39.4 & 1.000 & 1.000 \\
+Lee filter ($7{\times}7$, $L{=}40$) & 171.7 & 0.858 & 0.988 \\
+Stage 1, no physics prior & 14.7 & 0.608 & 1.348 \\
+Stage 1 + physics prior (v1) & 43.9 & 0.599 & 0.997 \\
+Stage 1 + prior (FiLM) & 52.1 & 0.659 & 0.995 \\
+Stage 1 + prior, no GAN & 49.5 & 0.624 & 0.998 \\
+Stage 1 + prior, no GAN (R18+FiLM) & 54.7 & 0.903 & 0.986 \\
+\bottomrule
+\end{tabular}

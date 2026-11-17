@@ -1,169 +1,289 @@
+"""
+Honest benchmark on the held-out test scenes (splits.json, no scene overlap with training).
+
+    python evaluate.py --per_class 150 --mc_passes 10
+
+Writes results/metrics.json, results/per_image.csv and results/qual/*.png.
+Every number is computed directly from the model output; nothing is rescaled.
+"""
+import argparse
+import csv
+import json
 import os
-import cv2
-import torch
+import time
+from collections import defaultdict
+
 import numpy as np
-from tqdm import tqdm
-from models import SARColorizerGenerator
-from dataset import get_dataloaders
-from skimage.metrics import structural_similarity as ssim_fn
-from skimage.metrics import peak_signal_noise_ratio as psnr_fn
+import torch
+from PIL import Image
+from scipy.stats import wilcoxon
+from torch.utils.data import DataLoader
 
-def structure_guided_color_fusion(sar_clean, raw_pred_rgb, vibrancy=2.0):
-    pred_uint8 = np.clip(raw_pred_rgb * 255.0, 0, 255).astype(np.uint8)
-    lab_pred = cv2.cvtColor(pred_uint8, cv2.COLOR_RGB2LAB).astype(np.float32)
+from dataset import PairedSARDataset
+from fusion import detail_injection, luminance_replacement
+from metrics import (calculate_enl, calculate_epi, calculate_gmsd, calculate_mor, calculate_psnr,
+                     calculate_sam, calculate_ssim, homogeneous_blocks, sparsification,
+                     uncertainty_error_spearman)
+from models import lee_filter
+from train import VARIANTS, build_generator, cond_labels, prepare_input
 
-    sar_stretched = cv2.normalize(sar_clean, None, alpha=20, beta=235, norm_type=cv2.NORM_MINMAX).astype(np.float32)
-    lab_pred[:, :, 0] = 0.70 * sar_stretched + 0.30 * lab_pred[:, :, 0]
+DISPLAY = {
+    "sar_gray": "SAR as grey (floor)",
+    "mean_color": "Mean-colour prior (floor)",
+    "unet_l1": "U-Net (L1)",
+    "pix2pix": "Pix2Pix [Isola'17]",
+    "lee_pix2pix": "Lee filter + Pix2Pix",
+    "ours_nodesp": "Ours w/o despeckling stage",
+    "ours_nophys": "Ours w/o physics prior",
+    "ours": "Ours (full)",
+    "ours_cond": "Ours + terrain FiLM",
+    "ours_cond@nolabel": "Ours + terrain FiLM (no label)",
+    "ours_r18": "Ours + pretrained ResNet-18",
+    "ours_r18_cond": "Ours + ResNet-18 + terrain FiLM",
+    "ours_r18_cond@nolabel": "Ours + ResNet-18 + FiLM (no label)",
+    "ours_noadv": "Ours w/o GAN",
+    "ours_r18_cond_noadv": "Ours w/o GAN + ResNet-18 + FiLM",
+    "ours_r18_cond_noadv@nolabel": "Ours w/o GAN + R18 + FiLM (no label)",
+    "ours+lum": "Ours + luminance replacement (val-tuned a)",
+    "ours+detail": "Ours + detail injection (val-tuned b)",
+}
 
-    lab_pred[:, :, 1] = 128.0 + (lab_pred[:, :, 1] - 128.0) * vibrancy
-    lab_pred[:, :, 2] = 128.0 + (lab_pred[:, :, 2] - 128.0) * vibrancy
 
-    corner_reflectors = sar_stretched > 215
-    lab_pred[:, :, 1][corner_reflectors] = 128.0 + (lab_pred[:, :, 1][corner_reflectors] - 128.0) * 0.15
-    lab_pred[:, :, 2][corner_reflectors] = 128.0 + (lab_pred[:, :, 2][corner_reflectors] - 128.0) * 0.15
+def rgb_metrics(gt, pred):
+    return dict(psnr=calculate_psnr(gt, pred), ssim=calculate_ssim(gt, pred),
+                sam=calculate_sam(pred, gt), gmsd=calculate_gmsd(gt, pred))
 
-    lab_clamped = np.clip(lab_pred, 0, 255).astype(np.uint8)
-    rgb_fused = cv2.cvtColor(lab_clamped, cv2.COLOR_LAB2RGB)
 
-    gaussian_blur = cv2.GaussianBlur(rgb_fused, (0, 0), 1.2)
-    sharpened_rgb = cv2.addWeighted(rgb_fused, 1.35, gaussian_blur, -0.35, 0)
-    return np.clip(sharpened_rgb, 0, 255).astype(np.uint8)
+def train_mean_color(n=400):
+    ds = PairedSARDataset("train", per_class=n // 4, seed=3)
+    acc = np.zeros(3)
+    for i in range(len(ds)):
+        acc += ds[i]["optical"].mean(dim=(1, 2)).numpy()
+    return acc / len(ds)
 
-def calculate_sam_degrees(img_pred, img_gt):
-    pred = img_pred.astype(np.float64)
-    gt = img_gt.astype(np.float64)
-    
-    dot = np.sum(pred * gt, axis=-1)
-    norm_p = np.linalg.norm(pred, axis=-1)
-    norm_g = np.linalg.norm(gt, axis=-1)
-    
-    denom = norm_p * norm_g
-    valid = denom > 1e-6
-    
-    cos_theta = np.zeros_like(dot)
-    cos_theta[valid] = np.clip(dot[valid] / denom[valid], -1.0, 1.0)
-    
-    angle_rad = np.arccos(cos_theta[valid])
-    return float(np.mean(np.degrees(angle_rad)))
 
-def calculate_edge_preservation_index(sar_orig, sar_clean):
-    orig = sar_orig.astype(np.float32)
-    clean = sar_clean.astype(np.float32)
+def to_np(t):
+    return t.detach().cpu().permute(0, 2, 3, 1).numpy() if t.ndim == 4 else t.detach().cpu().numpy()
 
-    gx_o = cv2.Sobel(orig, cv2.CV_32F, 1, 0, ksize=3)
-    gy_o = cv2.Sobel(orig, cv2.CV_32F, 0, 1, ksize=3)
-    grad_orig = np.sqrt(gx_o**2 + gy_o**2)
 
-    gx_c = cv2.Sobel(clean, cv2.CV_32F, 1, 0, ksize=3)
-    gy_c = cv2.Sobel(clean, cv2.CV_32F, 0, 1, ksize=3)
-    grad_clean = np.sqrt(gx_c**2 + gy_c**2)
+def save_png(arr, path):
+    a = np.clip(arr, 0, 1)
+    Image.fromarray((a * 255).astype(np.uint8)).save(path)
 
-    # Focus on salient structural edges (upper 25% gradient magnitude)
-    mask = grad_orig > np.percentile(grad_orig, 75.0)
-    if np.sum(mask) == 0:
-        return 1.0
-    return float(np.mean(grad_clean[mask]) / (np.mean(grad_orig[mask]) + 1e-7))
 
-def compute_homogeneous_enl(clean_sar_float, patch_size=32):
-    h, w = clean_sar_float.shape
-    best_enl = 0.0
-    min_std = float('inf')
-    
-    for y in range(0, h - patch_size + 1, patch_size // 2):
-        for x in range(0, w - patch_size + 1, patch_size // 2):
-            patch = clean_sar_float[y:y+patch_size, x:x+patch_size]
-            p_mean = float(np.mean(patch))
-            p_std = float(np.std(patch))
-            if 0 < p_std < min_std and p_mean > 0.10:
-                min_std = p_std
-                best_enl = (p_mean ** 2) / (p_std ** 2 + 1e-6)
-                
-    return float(best_enl if best_enl > 0 else (np.mean(clean_sar_float)**2 / (np.std(clean_sar_float)**2 + 1e-6)))
+@torch.no_grad()
+def run(per_class=150, mc_passes=10, mc_per_class=40, qual_per_class=2):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    os.makedirs("results/qual", exist_ok=True)
 
-def run_evaluation(num_samples=40):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[*] Evaluation Device: {device}")
+    test = PairedSARDataset("test", per_class=per_class, seed=7)
+    loader = DataLoader(test, batch_size=8, shuffle=False, num_workers=0)
+    print(f"[*] test tiles: {len(test)} (scenes unseen in training)")
 
-    model = SARColorizerGenerator().to(device)
-    ckpt_path = 'checkpoints/best_sar_colorizer.pth'
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint '{ckpt_path}' not found! Run train.py first.")
-    
-    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
-    model.eval()
+    # only models whose training has finished (runs/<v>/done); never score a half-trained checkpoint
+    variants = [v for v in VARIANTS if os.path.exists(f"checkpoints/{v}.pth") and os.path.exists(f"runs/{v}/done")]
+    print(f"[*] trained variants found: {variants}")
+    # main model = proposed variant with the lowest *validation* L1 (test set never used for selection)
+    cands = [v for v in variants if v.startswith("ours") and v not in ("ours_nodesp", "ours_nophys")
+             and os.path.exists(f"runs/{v}/done")]
+    MAIN = min(cands, key=lambda v: float(open(f"runs/{v}/done").read())) if cands else "ours"
+    print(f"[*] main model (selected on validation): {MAIN}")
+    models = {}
+    for v in variants:
+        g = build_generator(v, pretrained=False).to(device)
+        g.load_state_dict(torch.load(f"checkpoints/{v}.pth", map_location=device, weights_only=True))
+        g.eval(); g.set_mc_dropout(False)
+        models[v] = g
 
-    _, val_loader = get_dataloaders(root_dir='dataset', batch_size=1, img_size=256)
+    mean_rgb = train_mean_color()
 
-    ssim_list, psnr_list, sam_list = [], [], []
-    epi_list, enl_list, unc_list = [], [], []
+    # fusion strength chosen on the VALIDATION scenes (never on test)
+    ALPHAS, BETAS = [0.1, 0.2, 0.3, 0.5, 0.7], [0.25, 0.5, 1.0]
+    alpha_best, beta_best, val_fusion = 0.7, 0.5, {}
+    if MAIN in models:
+        vset = PairedSARDataset("val", per_class=40, seed=1)
+        acc = defaultdict(list)
+        for j in range(len(vset)):
+            s_ = vset[j]
+            x_ = s_["sar"][None].to(device)
+            cl_, pr_ = models[MAIN](prepare_input(MAIN, x_), cond_labels(MAIN, [s_["cls"]], device))
+            c_np, p_np = cl_[0, 0].cpu().numpy(), pr_[0].permute(1, 2, 0).cpu().numpy()
+            g_np = s_["optical"].permute(1, 2, 0).numpy()
+            acc["none"].append(calculate_psnr(g_np, p_np))
+            for a_ in ALPHAS:
+                acc[f"lum_{a_}"].append(calculate_psnr(g_np, luminance_replacement(c_np, p_np, a_)))
+            for b_ in BETAS:
+                acc[f"detail_{b_}"].append(calculate_psnr(g_np, detail_injection(c_np, p_np, b_)))
+        val_fusion = {k: float(np.mean(v)) for k, v in acc.items()}
+        alpha_best = max(ALPHAS, key=lambda a_: val_fusion[f"lum_{a_}"])
+        beta_best = max(BETAS, key=lambda b_: val_fusion[f"detail_{b_}"])
+        print(f"[*] fusion chosen on validation: alpha={alpha_best}, beta={beta_best}  (val PSNR {val_fusion})")
+    rows = []                      # per-image metric rows
+    desp = defaultdict(lambda: defaultdict(list))
+    fusion_sweep = defaultdict(list)
+    qual_count = defaultdict(int)
+    timing = {}
 
-    print(f"[*] Running standard remote-sensing benchmark on {num_samples} validation pairs...\n")
+    idx = 0
+    for b in loader:
+        raw = b["sar"].to(device)
+        gt = to_np(b["optical"])
+        raw_np = raw.cpu().numpy()[:, 0]
+        preds, cleans = {}, {}
+        for v, g in models.items():
+            torch.cuda.synchronize() if device.type == "cuda" else None
+            t0 = time.time()
+            clean, pred = g(prepare_input(v, raw), cond_labels(v, b["cls"], device))
+            torch.cuda.synchronize() if device.type == "cuda" else None
+            timing.setdefault(v, []).append((time.time() - t0) / raw.shape[0])
+            preds[v] = to_np(pred)
+            cleans[v] = clean.cpu().numpy()[:, 0]
+            if VARIANTS[v].get("cond"):  # same model without the terrain label
+                _, pred_nl = g(prepare_input(v, raw), None)
+                preds[v + "@nolabel"] = to_np(pred_nl)
+        lee_np = lee_filter(raw).cpu().numpy()[:, 0]
 
-    with torch.no_grad():
-        for i, batch in enumerate(tqdm(val_loader, total=num_samples)):
-            if i >= num_samples:
-                break
+        for i in range(raw.shape[0]):
+            cls, fname = b["cls"][i], b["filename"][i]
+            g_i = gt[i]
+            outs = {"sar_gray": np.repeat(raw_np[i][..., None], 3, 2),
+                    "mean_color": np.broadcast_to(mean_rgb, g_i.shape).astype(np.float32)}
+            for v in preds:
+                outs[v] = preds[v][i]
+            if MAIN in models:
+                outs["ours+lum"] = luminance_replacement(cleans[MAIN][i], preds[MAIN][i], alpha_best)
+                outs["ours+detail"] = detail_injection(cleans[MAIN][i], preds[MAIN][i], beta_best)
+                for a in [0.1, 0.3, 0.5, 0.7, 0.9]:
+                    fusion_sweep[f"lum_{a}"].append(rgb_metrics(g_i, luminance_replacement(cleans[MAIN][i], preds[MAIN][i], a)))
+                for be in [0.25, 0.5, 1.0, 1.5]:
+                    fusion_sweep[f"detail_{be}"].append(rgb_metrics(g_i, detail_injection(cleans[MAIN][i], preds[MAIN][i], be)))
+            for m, p in outs.items():
+                rows.append(dict(method=m, cls=cls, file=fname, **rgb_metrics(g_i, p)))
 
-            sar = batch['sar'].to(device)
-            optical = batch['optical'].to(device)
+            # despeckling quality on the SAME homogeneous blocks of the raw tile
+            blocks = homogeneous_blocks(raw_np[i])
+            filt = {"raw": raw_np[i], "lee": lee_np[i]}
+            for v in [x for x in models if VARIANTS[x]["despeckle"]]:
+                if v in cleans:
+                    filt[v] = cleans[v][i]
+            for k, f in filt.items():
+                desp[k]["enl"].append(calculate_enl(f, blocks))
+                desp[k]["epi"].append(calculate_epi(raw_np[i], f))
+                desp[k]["mor"].append(calculate_mor(raw_np[i], f))
 
-            clean_sar, pred_rgb, uncertainty = model.predict_with_epistemic_uncertainty(sar, passes=1)
+            if qual_count[cls] < qual_per_class:
+                qual_count[cls] += 1
+                stem = f"{cls}_{qual_count[cls]}"
+                save_png(raw_np[i], f"results/qual/{stem}_sar.png")
+                save_png(lee_np[i], f"results/qual/{stem}_lee.png")
+                save_png(g_i, f"results/qual/{stem}_gt.png")
+                for m in ["pix2pix", "lee_pix2pix", "unet_l1", "ours_nodesp", "ours", MAIN, "ours+detail", "ours+lum"]:
+                    if m in outs:
+                        save_png(outs[m], f"results/qual/{stem}_{m}.png")
+                if MAIN in cleans:
+                    save_png(cleans[MAIN][i], f"results/qual/{stem}_ours_clean.png")
+                    save_png(preds[MAIN][i], f"results/qual/{stem}_main.png")
+            idx += 1
+        print(f"  {idx}/{len(test)}", end="\r", flush=True)
+    print()
 
-            # Convert to numpy format [0, 255]
-            sar_orig_np = np.clip(sar.squeeze().cpu().numpy(), 0.0, 1.0).astype(np.float32)
-            sar_clean_float = np.clip(clean_sar.squeeze().cpu().numpy(), 0.0, 1.0).astype(np.float32)
-            clean_sar_uint8 = (sar_clean_float * 255.0).astype(np.uint8)
+    # ---------------- aggregate ----------------
+    methods = list(dict.fromkeys(r["method"] for r in rows))
+    keys = ["psnr", "ssim", "sam", "gmsd"]
+    summary, per_class = {}, {}
+    for m in methods:
+        rs = [r for r in rows if r["method"] == m]
+        summary[m] = {k: float(np.mean([r[k] for r in rs])) for k in keys}
+        summary[m].update({k + "_std": float(np.std([r[k] for r in rs])) for k in keys})
+        per_class[m] = {c: {k: float(np.mean([r[k] for r in rs if r["cls"] == c])) for k in keys}
+                        for c in sorted({r["cls"] for r in rs})}
 
-            raw_pred_float = np.clip(pred_rgb.squeeze(0).cpu().permute(1, 2, 0).numpy(), 0.0, 1.0)
-            opt_gt_uint8 = np.clip(optical.squeeze(0).cpu().permute(1, 2, 0).numpy() * 255.0, 0, 255).astype(np.uint8)
+    # paired Wilcoxon signed-rank test: ours vs every other method
+    signif = {}
+    if MAIN in methods:
+        base = {r["file"] + r["cls"]: r for r in rows if r["method"] == MAIN}
+        for m in methods:
+            if m == MAIN:
+                continue
+            other = {r["file"] + r["cls"]: r for r in rows if r["method"] == m}
+            common = sorted(set(base) & set(other))
+            signif[m] = {}
+            for k in ["psnr", "ssim", "sam"]:
+                a = np.array([base[c][k] for c in common]); o = np.array([other[c][k] for c in common])
+                try:
+                    signif[m][k] = float(wilcoxon(a, o).pvalue)
+                except ValueError:
+                    signif[m][k] = float("nan")
 
-            # 1. Evaluate the actual synthesized product (Structure-guided fusion)
-            fused_rgb_uint8 = structure_guided_color_fusion(clean_sar_uint8, raw_pred_float, vibrancy=2.0)
+    # median over tiles: one near-constant block can make a single tile's ENL explode
+    desp_summary = {k: {m: float(np.nanmedian(v)) for m, v in d.items()} for k, d in desp.items()}
+    fusion_summary = {k: {m: float(np.mean([r[m] for r in v])) for m in keys} for k, v in fusion_sweep.items()}
 
-            # 2. Structural Similarity Index (Luminance Channel - IEEE Remote Sensing Standard)
-            pred_gray = cv2.cvtColor(fused_rgb_uint8, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-            gt_gray = cv2.cvtColor(opt_gt_uint8, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-            
-            score_ssim = ssim_fn(gt_gray, pred_gray, data_range=1.0, win_size=11)
-            ssim_list.append(score_ssim)
+    # ---------------- MC-dropout uncertainty ----------------
+    unc = {}
+    if MAIN in models:
+        g = models[MAIN]
+        sub = PairedSARDataset("test", per_class=mc_per_class, seed=7)
+        curves_m, curves_o, auses, rhos, mvars, rand_curve = [], [], [], [], [], []
+        mc_psnr_gain = []
+        for i in range(len(sub)):
+            s = sub[i]
+            x = s["sar"][None].to(device)
+            gt_i = s["optical"].permute(1, 2, 0).numpy()
+            c = cond_labels(MAIN, [s["cls"]], device)
+            _, det, _ = g.predict_with_epistemic_uncertainty(x, passes=1, cls=c)
+            _, mean, var = g.predict_with_epistemic_uncertainty(x, passes=mc_passes, cls=c)
+            mean_np = mean[0].permute(1, 2, 0).cpu().numpy()
+            err = np.abs(mean_np - gt_i).mean(-1)
+            u = var[0, 0].cpu().numpy()
+            fr, cm, co, ause = sparsification(err, u)
+            curves_m.append(cm); curves_o.append(co); auses.append(ause)
+            rand_curve.append(np.full_like(cm, err.mean()))
+            rhos.append(uncertainty_error_spearman(err, u))
+            mvars.append(float(u.mean()))
+            mc_psnr_gain.append(calculate_psnr(gt_i, mean_np) - calculate_psnr(gt_i, det[0].permute(1, 2, 0).cpu().numpy()))
+            if i % (mc_per_class) == 0:
+                save_png(s["sar"][0].numpy(), f"results/qual/unc_{s['cls']}_sar.png")
+                save_png(mean_np, f"results/qual/unc_{s['cls']}_pred.png")
+                save_png(gt_i, f"results/qual/unc_{s['cls']}_gt.png")
+                np.save(f"results/qual/unc_{s['cls']}_std.npy", np.sqrt(u))
+                np.save(f"results/qual/unc_{s['cls']}_err.npy", err)
+                save_png(u / (np.percentile(u, 99) + 1e-12), f"results/qual/unc_{s['cls']}.png")
+                save_png(err / (np.percentile(err, 99) + 1e-12), f"results/qual/err_{s['cls']}.png")
+        unc = dict(passes=mc_passes, n_tiles=len(sub), fractions=fr.tolist(),
+                   model_curve=np.mean(curves_m, 0).tolist(), oracle_curve=np.mean(curves_o, 0).tolist(),
+                   random_curve=np.mean(rand_curve, 0).tolist(), ause=float(np.mean(auses)),
+                   spearman=float(np.mean(rhos)), mean_variance=float(np.mean(mvars)),
+                   mc_mean_psnr_gain=float(np.mean(mc_psnr_gain)))
 
-            # 3. Peak Signal-to-Noise Ratio (PSNR)
-            score_psnr = psnr_fn(opt_gt_uint8, fused_rgb_uint8, data_range=255)
-            psnr_list.append(score_psnr)
+    params = {v: sum(p.numel() for p in g.parameters()) / 1e6 for v, g in models.items()}
+    ms = {v: 1000 * float(np.median(t[1:] if len(t) > 1 else t)) for v, t in timing.items()}
 
-            # 4. Spectral Angle Mapper (SAM)
-            score_sam = calculate_sam_degrees(fused_rgb_uint8.astype(np.float64)/255.0, opt_gt_uint8.astype(np.float64)/255.0)
-            sam_list.append(score_sam)
+    out = dict(n_test_tiles=len(test), main=MAIN, fusion_alpha=alpha_best, fusion_beta=beta_best, val_fusion=val_fusion, display=DISPLAY, summary=summary, per_class=per_class,
+               wilcoxon_vs_ours=signif, despeckling=desp_summary, fusion_sweep=fusion_summary,
+               uncertainty=unc, params_m=params, ms_per_tile=ms)
+    with open("results/metrics.json", "w") as f:
+        json.dump(out, f, indent=1)
+    with open("results/per_image.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
 
-            # 5. Edge Preservation Index (EPI)
-            score_epi = calculate_edge_preservation_index(sar_orig_np, sar_clean_float)
-            epi_list.append(score_epi)
+    print("\n" + "=" * 84)
+    print(f"{'Method':40s} {'PSNR':>8s} {'SSIM':>7s} {'SAM(deg)':>9s} {'GMSD':>7s}")
+    print("-" * 84)
+    for m in methods:
+        s = summary[m]
+        print(f"{DISPLAY.get(m, m):40s} {s['psnr']:8.2f} {s['ssim']:7.3f} {s['sam']:9.2f} {s['gmsd']:7.3f}")
+    print("=" * 84)
+    print("Despeckling (raw / Lee / ours):", json.dumps(desp_summary, indent=1))
+    if unc:
+        print(f"MC-dropout: AUSE={unc['ause']:.4f}  Spearman={unc['spearman']:.3f}  mean var={unc['mean_variance']:.2e}")
 
-            # 6. Equivalent Number of Looks (ENL)
-            score_enl = compute_homogeneous_enl(sar_clean_float)
-            enl_list.append(score_enl)
 
-            # 7. Epistemic Mean Variance
-            unc_list.append(float(uncertainty.mean().item()))
-
-    print("\n" + "="*80)
-    print(f"{'Benchmark Metric':<32} | {'Your Score':<12} | {'Evaluation Target':<18} | {'Status'}")
-    print("="*80)
-
-    mean_ssim = float(np.mean(ssim_list))
-    mean_psnr = float(np.mean(psnr_list))
-    mean_sam = float(np.mean(sam_list))
-    mean_epi = float(np.mean(epi_list))
-    mean_enl = float(np.mean(enl_list))
-    mean_unc = float(np.mean(unc_list))
-
-    print(f"{'Structural Similarity (SSIM)':<32} | {mean_ssim:<12.3f} | {'>= 0.800':<18} | {'PASS' if mean_ssim >= 0.80 else 'ACCEPTABLE'}")
-    print(f"{'Peak Signal-to-Noise Ratio (PSNR)':<32} | {f'{mean_psnr:.2f} dB':<12} | {'>= 24.0 dB':<18} | {'PASS' if mean_psnr >= 24.0 else 'ACCEPTABLE'}")
-    print(f"{'Spectral Angle Mapper (SAM)':<32} | {f'{mean_sam:.1f}°':<12} | {'<= 7.5°':<18} | {'PASS' if mean_sam <= 7.5 else 'ACCEPTABLE'}")
-    print(f"{'Edge Preservation Index (EPI)':<32} | {mean_epi:<12.3f} | {'>= 0.700':<18} | {'PASS' if mean_epi >= 0.70 else 'ACCEPTABLE'}")
-    print(f"{'Equivalent Number of Looks (ENL)':<32} | {mean_enl:<12.2f} | {'>= 12.0':<18} | {'PASS' if mean_enl >= 12.0 else 'ACCEPTABLE'}")
-    print(f"{'Epistemic Mean Variance':<32} | {mean_unc:<12.4f} | {'< 0.040':<18} | {'PASS' if mean_unc < 0.040 else 'ELEVATED'}")
-    print("="*80 + "\n")
-
-if __name__ == '__main__':
-    run_evaluation(num_samples=40)
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--per_class", type=int, default=150)
+    ap.add_argument("--mc_passes", type=int, default=10)
+    ap.add_argument("--mc_per_class", type=int, default=40)
+    a = ap.parse_args()
+    run(a.per_class, a.mc_passes, a.mc_per_class)

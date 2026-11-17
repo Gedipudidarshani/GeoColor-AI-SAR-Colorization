@@ -1,0 +1,14 @@
+\begin{tabular}{lcccccccccc}
+\toprule
+Variant & S1 & $\mathcal{L}_{phys}$ & $\mathcal{L}_{s,g}$ & GAN & R18 & FiLM & PSNR$\uparrow$ & SSIM$\uparrow$ & SAM$\downarrow$ & MoR \\
+\midrule
+U-Net (L1) & -- & -- & -- & -- & -- & -- & 14.14 & 0.237 & 11.23 & -- \\
+Pix2Pix & -- & -- & -- & \checkmark & -- & -- & 12.58 & 0.149 & 16.96 & -- \\
+Ours w/o despeckle & -- & -- & \checkmark & \checkmark & -- & -- & 12.55 & 0.153 & 14.07 & -- \\
+Ours w/o physics prior & \checkmark & -- & \checkmark & \checkmark & -- & -- & 12.54 & 0.173 & 16.67 & 1.348 \\
+Ours (v1) & \checkmark & \checkmark & \checkmark & \checkmark & -- & -- & 12.14 & 0.161 & 14.45 & 0.997 \\
+Ours + FiLM & \checkmark & \checkmark & \checkmark & \checkmark & -- & \checkmark & 11.84 & 0.156 & 14.27 & 0.995 \\
+Ours w/o GAN & \checkmark & \checkmark & \checkmark & -- & -- & -- & 14.47 & 0.247 & 11.74 & 0.998 \\
+\textbf{Ours (final)} & \checkmark & \checkmark & \checkmark & -- & \checkmark & \checkmark & 14.33 & 0.248 & 11.81 & 0.986 \\
+\bottomrule
+\end{tabular}

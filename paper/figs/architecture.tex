@@ -1,0 +1,24 @@
+% Architecture diagram (TikZ) -- compiled inline, no external image needed.
+\begin{tikzpicture}[
+  font=\footnotesize, >=Stealth, node distance=3mm,
+  box/.style={draw=black!70, rounded corners=1.5pt, align=center, minimum height=8.5mm, inner sep=2pt, fill=white},
+  stage/.style={box, fill=blue!7},
+  loss/.style={box, dashed, fill=orange!8, minimum height=6mm},
+  lab/.style={font=\scriptsize\itshape, text=black!65}]
+  \node[box, minimum width=12mm] (y) {SAR $Y$\\[-1pt]\scriptsize $1{\times}H{\times}W$};
+  \node[stage, right=4mm of y, minimum width=21mm] (s1) {Stage 1\\homomorphic\\despeckler};
+  \node[stage, right=5mm of s1, minimum width=27mm] (s2) {Stage 2\\ResNet-18 enc. + U-Net dec.\\(MC dropout)};
+  \node[box, right=5mm of s2, minimum width=17mm] (fu) {Stage 3\\optional\\fusion};
+  \node[box, right=4mm of fu, minimum width=11mm] (out) {RGB\\$\hat{I}$};
+  \draw[->] (y) -- (s1);
+  \draw[->] (s1) -- node[above, lab]{$\hat X$} (s2);
+  \draw[->] (s2) -- node[above, lab]{$\hat I_{0}$} (fu);
+  \draw[->] (fu) -- (out);
+  \draw[->] (s1.south) -- ++(0,-3.5mm) -| node[pos=0.25, below, lab]{despeckled $\hat X$} (fu.south);
+  \node[box, above=3mm of s2, minimum width=27mm, fill=black!4] (film) {terrain $c$ $\rightarrow$ FiLM $(\gamma_c,\beta_c)$};
+  \draw[->, black!60] (film.south) -- (s2.north);
+  \node[loss, below=9mm of s1, minimum width=26mm] (lp) {$\mathcal{L}_{phys}=\lambda_{r}\mathcal{L}_{rad}+\lambda_{tv}\mathcal{L}_{tv}$};
+  \node[loss, below=9mm of s2, minimum width=30mm] (lc) {$\lambda_1\mathcal{L}_1+\lambda_s\mathcal{L}_{SSIM}+\lambda_g\mathcal{L}_{grad}$};
+  \draw[->, dashed, black!60] (lp) -- (s1);
+  \draw[->, dashed, black!60] (lc) -- (s2);
+\end{tikzpicture}

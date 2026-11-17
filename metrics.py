@@ -1,72 +1,155 @@
-import numpy as np
+"""
+Evaluation metrics for SAR-to-optical colorization and SAR despeckling.
+
+All functions return the raw measured value. No scaling, clipping-to-target or
+fallback constants are applied (the previous version clipped EPI into
+[0.72, 0.85] and returned a hard-coded 0.822, which invalidated the numbers).
+
+Images are float arrays in [0, 1]; RGB arrays are [H, W, 3].
+"""
 import cv2
-import torch
-from pytorch_msssim import ssim as msssim
+import numpy as np
+from scipy.stats import spearmanr
+from skimage.metrics import peak_signal_noise_ratio as _psnr
+from skimage.metrics import structural_similarity as _ssim
 
-def calculate_psnr(img_pred, img_gt, data_range=1.0):
-    """Peak Signal-to-Noise Ratio (PSNR) in dB."""
-    mse = np.mean((img_pred.astype(np.float64) - img_gt.astype(np.float64)) ** 2)
-    if mse == 0:
-        return float('inf')
-    return float(20.0 * np.log10(data_range / np.sqrt(mse)))
 
-def calculate_ssim(img_pred_tensor, img_gt_tensor):
-    """
-    Structural Similarity Index (SSIM).
-    Expects 4D torch tensors [B, C, H, W] normalized in [0, 1].
-    """
-    return float(msssim(img_pred_tensor, img_gt_tensor, data_range=1.0, win_size=7).item())
+# --------------------------------------------------------------------------- #
+# Full-reference metrics (prediction vs. Sentinel-2 ground truth)
+# --------------------------------------------------------------------------- #
+def calculate_psnr(gt, pred):
+    return float(_psnr(gt, pred, data_range=1.0))
 
-def calculate_sam(img_pred, img_gt):
-    """
-    Spectral Angle Mapper (SAM) in degrees.
-    Expects numpy arrays of shape [H, W, 3] in range [0, 1].
-    """
-    pred = img_pred.astype(np.float64)
-    gt = img_gt.astype(np.float64)
-    
-    dot_product = np.sum(pred * gt, axis=-1)
-    norm_pred = np.linalg.norm(pred, axis=-1)
-    norm_gt = np.linalg.norm(gt, axis=-1)
-    
-    denom = norm_pred * norm_gt
-    valid_mask = denom > 1e-7
-    
-    cos_theta = np.zeros_like(dot_product)
-    cos_theta[valid_mask] = np.clip(dot_product[valid_mask] / denom[valid_mask], -1.0, 1.0)
-    
-    angles_rad = np.arccos(cos_theta[valid_mask])
-    sam_deg = np.mean(np.degrees(angles_rad))
-    return float(sam_deg)
 
-def calculate_enl(image_np):
-    """Equivalent Number of Looks (ENL) to quantify despeckling performance."""
-    if image_np.ndim == 3:
-        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+def calculate_ssim(gt, pred):
+    return float(_ssim(gt, pred, data_range=1.0, channel_axis=2 if gt.ndim == 3 else None))
+
+
+def calculate_sam(pred, gt, eps=1e-8):
+    """Spectral Angle Mapper (Kruse et al., 1993), mean angle in degrees."""
+    p = pred.reshape(-1, pred.shape[-1]).astype(np.float64)
+    g = gt.reshape(-1, gt.shape[-1]).astype(np.float64)
+    denom = np.linalg.norm(p, axis=1) * np.linalg.norm(g, axis=1)
+    valid = denom > eps
+    cos = np.clip((p[valid] * g[valid]).sum(1) / denom[valid], -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos)).mean())
+
+
+def _luma(rgb):
+    return (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
+
+
+def calculate_gmsd(gt, pred, c=0.0026):
+    """Gradient Magnitude Similarity Deviation (Xue et al., 2014). Lower is better.
+    Measures how well edges/structure of the prediction match the reference."""
+    g, p = _luma(gt), _luma(pred)
+    k = np.array([[1, 0, -1], [1, 0, -1], [1, 0, -1]], np.float32) / 3.0
+    def gm(x):
+        return np.sqrt(cv2.filter2D(x, -1, k) ** 2 + cv2.filter2D(x, -1, k.T) ** 2)
+    gg, gp = gm(g), gm(p)
+    gms = (2 * gg * gp + c) / (gg ** 2 + gp ** 2 + c)
+    return float(gms.std())
+
+
+# --------------------------------------------------------------------------- #
+# No-reference despeckling metrics (despeckled SAR vs. raw SAR)
+# --------------------------------------------------------------------------- #
+def homogeneous_blocks(raw, block=16, frac=0.10, min_mean=0.05):
+    """Pick the `frac` most homogeneous blocks (lowest coefficient of variation)
+    of the *raw* image. The same blocks are then used for raw and filtered
+    images so ENL values are directly comparable."""
+    h, w = raw.shape
+    cands = []
+    for y in range(0, h - block + 1, block):
+        for x in range(0, w - block + 1, block):
+            p = raw[y:y + block, x:x + block]
+            m = p.mean()
+            if m > min_mean:
+                cands.append((p.std() / m, y, x))
+    cands.sort()
+    n = max(1, int(len(cands) * frac))
+    return [(y, x) for _, y, x in cands[:n]]
+
+
+def calculate_enl(img, blocks=None, block=16):
+    """Equivalent Number of Looks, ENL = mean^2 / var, averaged over homogeneous
+    blocks. Higher means stronger speckle suppression."""
+    img = img.astype(np.float64)
+    if img.max() > 1.0:
+        img = img / 255.0
+    if img.ndim == 3:
+        img = img[..., 0]
+    if blocks is None:
+        blocks = homogeneous_blocks(img, block)
+    vals = []
+    for y, x in blocks:
+        p = img[y:y + block, x:x + block]
+        v = p.var()
+        if v > 1e-10:
+            vals.append(p.mean() ** 2 / v)
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def calculate_epi(raw, filtered):
+    """Edge Preservation Index (Sattar et al., 1997): correlation of the Laplacian
+    high-pass of the filtered image with that of the raw image. 1 = all edges
+    (and all speckle) kept; must be read together with ENL, because a filter that
+    does nothing also scores 1."""
+    a = cv2.Laplacian(raw.astype(np.float64), cv2.CV_64F)
+    b = cv2.Laplacian(filtered.astype(np.float64), cv2.CV_64F)
+    a, b = a - a.mean(), b - b.mean()
+    return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-12))
+
+
+def calculate_mor(raw, filtered, eps=1e-3):
+    """Mean of Ratio image Y / X_hat. For an unbiased multiplicative-speckle
+    filter the ratio image is pure speckle with unit mean (ideal = 1.0)."""
+    m = filtered > eps
+    return float((raw[m] / filtered[m]).mean())
+
+
+def calculate_entropy(image):
+    """Shannon entropy (bits) of the 8-bit luminance histogram."""
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image if image.dtype == np.uint8 else (image * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
     else:
-        gray = image_np.astype(np.float32)
-    mean_val = np.mean(gray)
-    std_val = np.std(gray)
-    if std_val == 0:
-        return 0.0
-    return float((mean_val ** 2) / (std_val ** 2))
+        gray = image if image.dtype == np.uint8 else (image * 255).astype(np.uint8)
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    p = hist / (hist.sum() + 1e-12)
+    p = p[p > 0]
+    return float(-(p * np.log2(p)).sum())
 
-def calculate_epi(original_sar, despeckled_sar):
-    """Edge Preservation Index (EPI) using directional gradients."""
-    if original_sar.ndim == 3:
-        orig = cv2.cvtColor(original_sar, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    else:
-        orig = original_sar.astype(np.float32)
-        
-    if despeckled_sar.ndim == 3:
-        filt = cv2.cvtColor(despeckled_sar, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    else:
-        filt = despeckled_sar.astype(np.float32)
 
-    diff_orig = np.abs(orig[1:, :] - orig[:-1, :])
-    diff_filt = np.abs(filt[1:, :] - filt[:-1, :])
-    sum_orig = np.sum(diff_orig)
-    sum_filt = np.sum(diff_filt)
-    if sum_orig == 0:
-        return 1.0
-    return float(sum_filt / sum_orig)
+# --------------------------------------------------------------------------- #
+# Uncertainty quality
+# --------------------------------------------------------------------------- #
+def sparsification(error, uncertainty, steps=20):
+    """Sparsification curves (Ilg et al., 2018).
+
+    Pixels are removed in order of decreasing uncertainty (model curve) or of
+    decreasing true error (oracle curve); the mean error of the remaining pixels
+    is recorded. AUSE = area between model and oracle curves (lower = better
+    ranking of errors by the uncertainty)."""
+    e = error.ravel()
+    u = uncertainty.ravel()
+    order_u = np.argsort(-u)
+    order_e = np.argsort(-e)
+    fr = np.linspace(0, 0.95, steps)
+    n = e.size
+    model, oracle = [], []
+    for f in fr:
+        k = int(f * n)
+        model.append(e[order_u[k:]].mean())
+        oracle.append(e[order_e[k:]].mean())
+    model, oracle = np.array(model), np.array(oracle)
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
+    ause = float(_trapz(model - oracle, fr))
+    return fr, model, oracle, ause
+
+
+def uncertainty_error_spearman(error, uncertainty, max_pts=20000, seed=0):
+    e, u = error.ravel(), uncertainty.ravel()
+    if e.size > max_pts:
+        idx = np.random.default_rng(seed).choice(e.size, max_pts, replace=False)
+        e, u = e[idx], u[idx]
+    return float(spearmanr(u, e).correlation)
