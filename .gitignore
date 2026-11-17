@@ -15,3 +15,6 @@ colorized_*.png
 *.log
 .vscode/
 .idea/
+
+~$*
+paper/figs/eq/
